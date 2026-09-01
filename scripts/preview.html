@@ -1,0 +1,60 @@
+<!doctype html>
+<!--
+  A renderer harness, not a page of the site. Lives under scripts/ because
+  vite.config.ts skips that directory when collecting build entries, so this
+  never ships to dist/.
+
+  Headless screenshots of the real game land wherever the animation happens to
+  be, which in practice is always the apex of a bounce — the one moment the
+  brush trail is meant to be invisible. This drives the game to a chosen frame
+  with chosen input and draws it, so a fast-moving stroke can actually be
+  looked at. `?frames=90&dir=right` etc.
+-->
+<html lang="en-AU">
+  <head>
+    <meta charset="UTF-8" />
+    <title>renderer preview</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #e4d9c4;
+        overflow: hidden;
+      }
+      canvas {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="stage"></canvas>
+    <script type="module">
+      import { createGame, step, resetCooldown } from "../game.ts";
+      import { createRenderer } from "../render.ts";
+
+      const params = new URLSearchParams(location.search);
+      const frames = Number(params.get("frames") ?? 70);
+      const dir = params.get("dir") ?? "right";
+      const fire = params.get("fire") === "1";
+
+      const canvas = document.getElementById("stage");
+      const renderer = createRenderer(canvas);
+
+      resetCooldown();
+      let state = createGame();
+      const input = { left: dir === "left", right: dir === "right", fire };
+
+      // Step and draw in lockstep: the trail accumulates one sample per draw,
+      // so it only looks right if the renderer sees every frame the physics
+      // produced, exactly as it would in the real loop.
+      const STEP = 1 / 120;
+      for (let f = 0; f < frames; f++) {
+        step(state, input, STEP);
+        step(state, input, STEP);
+        renderer.draw(state, f * 16.7);
+      }
+
+      document.title = `preview f=${frames} status=${state.status} y=${Math.round(state.player.y)} vy=${Math.round(state.player.vy)} vx=${Math.round(state.player.vx)}`;
+    </script>
+  </body>
+</html>

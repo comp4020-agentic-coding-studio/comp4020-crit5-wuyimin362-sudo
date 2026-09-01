@@ -12,7 +12,10 @@ body {
   height: 100%;
   margin: 0;
   overflow: hidden;
-  background: #04050c;
+  /* The paper the scroll is mounted on. Matches PAPER_DEEP in render.ts so
+     the letterbox is continuous with the drawing, and so the first paint is
+     already the right colour instead of a dark flash. */
+  background: #e4d9c4;
 }
 
 body {

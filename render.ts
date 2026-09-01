@@ -1,11 +1,24 @@
 // Everything you see, and nothing you can lose by. The renderer reads game
-// state and never writes it: particles, screen shake and squash live here
-// because none of them are rules.
+// state and never writes it: paper, ink, brush trails, shake and squash live
+// here because none of them are rules.
 //
-// The sky is the reason this file has opinions. Altitude drives a gradient
-// from night ground through an atmosphere burn into open space, so "how far
-// up am I" is answered by the colour of the screen rather than by a label.
-// That is the only progress instruction the game is allowed.
+// The conceit is that the player *is* the brush. You are a nib climbing a
+// hanging scroll, and the trail behind you is the stroke you are painting —
+// which is why the trail thickens with speed and tapers to nothing at its
+// tail, the way a real stroke does when the brush lifts.
+//
+// Ink carries the affordances that colour used to. Chinese brush painting
+// already has a vocabulary for exactly the distinction this game needs:
+//
+//   - 浓墨  dense wet ink      -> a solid platform. Full-bellied, it holds.
+//   - 飞白  "flying white"     -> a broken one. A dry brush dragged fast
+//                                leaves streaks of bare paper through the
+//                                stroke; the mark is visibly not solid.
+//   - 湿墨  wet ink, bleeding  -> a trampoline. Loaded with water, springy.
+//
+// That reads without colour at all, which is a better answer to the
+// no-instructions rule than the cyan/orange/violet scheme it replaces — and
+// it survives a colourblind player, who previously had only hue to go on.
 
 import {
   progressY,
@@ -18,27 +31,23 @@ import {
 
 const { PLATFORM_W, PLATFORM_H, PLAYER_W, PLAYER_H, MONSTER_W, MONSTER_H } = TUNING;
 
-type Rgb = [number, number, number];
+// The five tones of ink, plus the paper they sit on and one vermillion for
+// the seal and for danger. Nothing else gets a colour.
+const PAPER = "#efe7d7";
+const PAPER_DEEP = "#e4d9c4";
+const INK = "26 24 20"; // rgb triplet, used with varying alpha
+const CINNABAR = "#b03a2a";
 
-interface SkyStop {
-  at: number;
-  top: Rgb;
-  bottom: Rgb;
+interface TrailPoint {
+  x: number;
+  /**
+   * World y, not screen y. The scroll moves under the stroke, so a trail
+   * recorded in screen space hangs in the air where the world used to be.
+   */
+  worldY: number;
+  w: number;
+  break: boolean; // true when the player wrapped the seam between samples
 }
-
-// Night ground -> atmosphere glow -> sunset band -> thin air -> space.
-const SKY: SkyStop[] = [
-  { at: 0.0, top: [22, 34, 78], bottom: [10, 15, 38] },
-  { at: 0.3, top: [91, 47, 110], bottom: [36, 26, 68] },
-  { at: 0.55, top: [122, 58, 94], bottom: [42, 28, 74] },
-  { at: 0.78, top: [16, 26, 58], bottom: [6, 10, 28] },
-  { at: 1.0, top: [2, 3, 12], bottom: [0, 0, 6] },
-];
-
-const CYAN = "#5ff2ff";
-const AMBER = "#ffa14d";
-const VIOLET = "#c77dff";
-const HOT = "#ff5d8f";
 
 interface Particle {
   x: number;
@@ -47,55 +56,21 @@ interface Particle {
   vy: number;
   life: number;
   maxLife: number;
-  hue: string;
   size: number;
 }
 
-interface Star {
-  x: number;
-  y: number;
-  r: number;
-  twinkle: number;
+function ink(alpha: number): string {
+  return `rgba(${INK} / ${alpha})`;
 }
 
 function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
-function mix(a: Rgb, b: Rgb, t: number): string {
-  return `rgb(${Math.round(lerp(a[0], b[0], t))} ${Math.round(lerp(a[1], b[1], t))} ${Math.round(
-    lerp(a[2], b[2], t),
-  )})`;
-}
-
-function skyAt(progress: number): { top: string; bottom: string } {
-  const p = Math.max(0, Math.min(1, progress));
-  let lo = SKY[0]!;
-  let hi = SKY[SKY.length - 1]!;
-  for (let i = 0; i < SKY.length - 1; i++) {
-    if (p >= SKY[i]!.at && p <= SKY[i + 1]!.at) {
-      lo = SKY[i]!;
-      hi = SKY[i + 1]!;
-      break;
-    }
-  }
-  const span = hi.at - lo.at || 1;
-  const t = (p - lo.at) / span;
-  return { top: mix(lo.top, hi.top, t), bottom: mix(lo.bottom, hi.bottom, t) };
-}
-
-function starLayer(count: number, seed: number): Star[] {
-  let s = seed;
-  const rand = () => {
-    s = (s * 1_664_525 + 1_013_904_223) >>> 0;
-    return s / 0x1_0000_0000;
-  };
-  return Array.from({ length: count }, () => ({
-    x: rand() * WORLD_WIDTH,
-    y: rand() * VIEW_HEIGHT,
-    r: 0.5 + rand() * 1.4,
-    twinkle: rand() * Math.PI * 2,
-  }));
+/** Deterministic per-id jitter, so a platform's hand-drawn wobble holds still. */
+function wobble(id: number, salt: number): number {
+  const n = Math.sin(id * 12.9898 + salt * 78.233) * 43_758.5453;
+  return n - Math.floor(n); // 0..1
 }
 
 export interface Renderer {
@@ -106,29 +81,69 @@ export interface Renderer {
 export function createRenderer(canvas: HTMLCanvasElement): Renderer {
   const ctx = canvas.getContext("2d")!;
   const particles: Particle[] = [];
-  // Three layers at different parallax rates; tiled vertically so the field
-  // never runs out on a 12,000px climb.
-  const layers = [
-    { stars: starLayer(46, 7), factor: 0.12, alpha: 0.45 },
-    { stars: starLayer(34, 99), factor: 0.28, alpha: 0.7 },
-    { stars: starLayer(18, 1234), factor: 0.5, alpha: 1 },
-  ];
+  const trail: TrailPoint[] = [];
 
   let lastVy = 0;
+  let lastX = WORLD_WIDTH / 2;
   let shake = 0;
   let scale = 1;
   let offsetX = 0;
   let offsetY = 0;
+
+  // The paper is expensive to speckle and never changes, so it is painted
+  // once into an offscreen canvas and blitted.
+  const paper = document.createElement("canvas");
+  paper.width = WORLD_WIDTH;
+  paper.height = VIEW_HEIGHT;
+  paintPaper(paper.getContext("2d")!);
+
+  function paintPaper(p: CanvasRenderingContext2D): void {
+    p.fillStyle = PAPER;
+    p.fillRect(0, 0, WORLD_WIDTH, VIEW_HEIGHT);
+
+    // A faint warm unevenness, like sizing that took the ink differently.
+    // Both circles must share a centre: giving them different ones makes a
+    // cone gradient, which showed up as hard diagonal facets across the sheet.
+    for (let i = 0; i < 26; i++) {
+      const cx = Math.random() * WORLD_WIDTH;
+      const cy = Math.random() * VIEW_HEIGHT;
+      const g = p.createRadialGradient(cx, cy, 4, cx, cy, 140 + Math.random() * 160);
+      g.addColorStop(0, "rgba(212 196 168 / 0.16)");
+      g.addColorStop(1, "rgba(212 196 168 / 0)");
+      p.fillStyle = g;
+      p.fillRect(0, 0, WORLD_WIDTH, VIEW_HEIGHT);
+    }
+
+    // Fibres: short pale threads pressed into the sheet.
+    for (let i = 0; i < 380; i++) {
+      const x = Math.random() * WORLD_WIDTH;
+      const y = Math.random() * VIEW_HEIGHT;
+      const len = 3 + Math.random() * 12;
+      const a = Math.random() * Math.PI;
+      p.strokeStyle = `rgba(150 136 112 / ${0.03 + Math.random() * 0.07})`;
+      p.lineWidth = 0.7;
+      p.beginPath();
+      p.moveTo(x, y);
+      p.lineTo(x + Math.cos(a) * len, y + Math.sin(a) * len);
+      p.stroke();
+    }
+
+    // Speckle.
+    for (let i = 0; i < 900; i++) {
+      p.fillStyle = `rgba(120 106 84 / ${0.02 + Math.random() * 0.06})`;
+      p.beginPath();
+      p.arc(Math.random() * WORLD_WIDTH, Math.random() * VIEW_HEIGHT, Math.random() * 0.9, 0, 7);
+      p.fill();
+    }
+  }
 
   function resize(): void {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const vw = window.innerWidth;
     const vh = window.innerHeight;
     scale = Math.min(vw / WORLD_WIDTH, vh / VIEW_HEIGHT);
-    const w = WORLD_WIDTH * scale;
-    const h = VIEW_HEIGHT * scale;
-    offsetX = (vw - w) / 2;
-    offsetY = (vh - h) / 2;
+    offsetX = (vw - WORLD_WIDTH * scale) / 2;
+    offsetY = (vh - VIEW_HEIGHT * scale) / 2;
 
     canvas.width = Math.round(vw * dpr);
     canvas.height = Math.round(vh * dpr);
@@ -137,422 +152,535 @@ export function createRenderer(canvas: HTMLCanvasElement): Renderer {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  function burst(x: number, y: number, hue: string, count: number, spread: number): void {
-    for (let i = 0; i < count; i++) {
-      const a = Math.random() * Math.PI * 2;
-      const sp = spread * (0.3 + Math.random() * 0.7);
-      particles.push({
-        x,
-        y,
-        vx: Math.cos(a) * sp,
-        vy: Math.abs(Math.sin(a)) * sp * 0.6,
-        life: 1,
-        maxLife: 0.4 + Math.random() * 0.4,
-        hue,
-        size: 1.5 + Math.random() * 2.5,
-      });
-    }
-  }
-
-  /** World y (up) to screen y (down), within the 480x720 logical stage. */
   function sy(worldY: number, cameraY: number): number {
     return VIEW_HEIGHT - (worldY - cameraY);
   }
 
-  function glow(color: string, blur: number): void {
-    ctx.shadowColor = color;
-    ctx.shadowBlur = blur;
-  }
+  /**
+   * One brush stroke: thick through the belly, tapering at both ends, with a
+   * damp halo where the ink has crept into the paper. `dryness` from 0 to 1
+   * scrapes flying-white through it.
+   */
+  function stroke(
+    x: number,
+    y: number,
+    len: number,
+    weight: number,
+    darkness: number,
+    dryness: number,
+    id: number,
+  ): void {
+    const steps = 22;
+    const lift = wobble(id, 1) * 3 - 1.5; // the stroke is not perfectly level
+    const belly = 0.62 + wobble(id, 2) * 0.22; // where the brush pressed hardest
 
-  function noGlow(): void {
-    ctx.shadowBlur = 0;
-  }
+    const edge = (t: number): number => {
+      // Fat in the middle, tapered at the ends; the peak sits off-centre the
+      // way a real stroke does, because the hand accelerates through it.
+      const shaped = t < belly ? t / belly : (1 - t) / (1 - belly);
+      return Math.pow(Math.max(0, shaped), 0.55);
+    };
 
-  function roundRect(x: number, y: number, w: number, h: number, r: number): void {
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.arcTo(x + w, y, x + w, y + h, r);
-    ctx.arcTo(x + w, y + h, x, y + h, r);
-    ctx.arcTo(x, y + h, x, y, r);
-    ctx.arcTo(x, y, x + w, y, r);
-    ctx.closePath();
+    const path = (spread: number) => {
+      ctx.beginPath();
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const px = x + len * t;
+        const py = y + lift * Math.sin(t * Math.PI) + Math.sin(t * 5 + id) * 0.6;
+        ctx.lineTo(px, py - (edge(t) * weight * spread) / 2);
+      }
+      for (let i = steps; i >= 0; i--) {
+        const t = i / steps;
+        const px = x + len * t;
+        const py = y + lift * Math.sin(t * Math.PI) + Math.sin(t * 5 + id) * 0.6;
+        ctx.lineTo(px, py + (edge(t) * weight * spread) / 2);
+      }
+      ctx.closePath();
+    };
+
+    // Bleed halo first, then the body over it.
+    ctx.fillStyle = ink(darkness * 0.16);
+    path(1.5);
+    ctx.fill();
+    ctx.fillStyle = ink(darkness);
+    path(1);
+    ctx.fill();
+
+    if (dryness > 0) {
+      // 飞白: drag streaks of bare paper back through the mark. The brush has
+      // run out of ink, and the stroke stops being a solid thing.
+      const streaks = 4 + Math.floor(dryness * 4);
+      ctx.save();
+      ctx.globalCompositeOperation = "destination-out";
+      for (let s = 0; s < streaks; s++) {
+        const off = (wobble(id, 10 + s) - 0.5) * weight * 0.9;
+        const from = wobble(id, 20 + s) * 0.35;
+        const to = 0.62 + wobble(id, 30 + s) * 0.38;
+        ctx.strokeStyle = `rgba(0 0 0 / ${0.5 + dryness * 0.45})`;
+        ctx.lineWidth = 0.8 + wobble(id, 40 + s) * 1.5;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        for (let i = 0; i <= 10; i++) {
+          const t = from + ((to - from) * i) / 10;
+          ctx.lineTo(x + len * t, y + off + Math.sin(t * 7 + s) * 0.8);
+        }
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
   }
 
   function drawPlatform(
-    x: number,
-    y: number,
-    kind: GameState["platforms"][number]["kind"],
+    plat: GameState["platforms"][number],
+    screenY: number,
     now: number,
   ): void {
-    if (kind === "trampoline") {
-      // A treat, and it should look like one: brighter, breathing.
-      const pulse = 0.6 + 0.4 * Math.sin(now * 0.006);
-      glow(VIOLET, 18 + pulse * 14);
-      ctx.fillStyle = VIOLET;
-      roundRect(x, y, PLATFORM_W, PLATFORM_H, 7);
-      ctx.fill();
-      noGlow();
-      ctx.strokeStyle = "rgba(255 255 255 / 0.75)";
-      ctx.lineWidth = 1.5;
+    const id = plat.id;
+    if (plat.kind === "trampoline") {
+      // 湿墨: loaded with water. Heavier, and it breathes.
+      const pulse = 0.9 + 0.1 * Math.sin(now * 0.005 + id);
+      stroke(plat.x, screenY + PLATFORM_H / 2, PLATFORM_W, PLATFORM_H * 1.5 * pulse, 0.9, 0, id);
+      // Pooling where the ink gathered at the end of the stroke.
+      ctx.fillStyle = ink(0.28);
       ctx.beginPath();
-      for (let i = 0; i <= 4; i++) {
-        const px = x + 8 + (i * (PLATFORM_W - 16)) / 4;
-        ctx.moveTo(px, y + 3);
-        ctx.lineTo(px, y + PLATFORM_H - 3);
-      }
-      ctx.stroke();
+      ctx.ellipse(plat.x + PLATFORM_W * 0.62, screenY + PLATFORM_H / 2, 15, 7, 0, 0, 7);
+      ctx.fill();
       return;
     }
 
-    if (kind === "broken") {
-      // Dim, warm, and visibly split. It must not read as "solid but tinted":
-      // the gap down the middle is the tell, and it survives a colourblind
-      // player because the shape differs, not only the hue.
-      glow(AMBER, 10);
-      ctx.fillStyle = "rgba(255 161 77 / 0.55)";
-      roundRect(x, y, PLATFORM_W * 0.42, PLATFORM_H, 5);
-      ctx.fill();
-      roundRect(x + PLATFORM_W * 0.58, y, PLATFORM_W * 0.42, PLATFORM_H, 5);
-      ctx.fill();
-      noGlow();
-      ctx.strokeStyle = "rgba(255 200 150 / 0.5)";
-      ctx.setLineDash([3, 4]);
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(x + PLATFORM_W * 0.44, y + PLATFORM_H / 2);
-      ctx.lineTo(x + PLATFORM_W * 0.56, y + PLATFORM_H / 2);
-      ctx.stroke();
-      ctx.setLineDash([]);
+    if (plat.kind === "broken") {
+      // 飞白: a dry brush, dragged. Paler, thinner, shot through with paper.
+      stroke(plat.x, screenY + PLATFORM_H / 2, PLATFORM_W, PLATFORM_H * 0.72, 0.42, 1, id);
       return;
     }
 
-    glow(CYAN, 16);
-    ctx.fillStyle = CYAN;
-    roundRect(x, y, PLATFORM_W, PLATFORM_H, 7);
-    ctx.fill();
-    noGlow();
-    ctx.fillStyle = "rgba(255 255 255 / 0.55)";
-    roundRect(x + 6, y + 2, PLATFORM_W - 12, 2.5, 1.5);
-    ctx.fill();
+    stroke(plat.x, screenY + PLATFORM_H / 2, PLATFORM_W, PLATFORM_H, 0.88, 0, id);
   }
 
-  function drawCraft(cx: number, feetY: number, vy: number, now: number): void {
-    // Squash on the way down, stretch on the way up: the whole feel of the
-    // bounce lives in these two numbers.
+  /** The brush itself: a loaded nib, nose up, wider when it is pressing. */
+  function drawNib(cx: number, feetY: number, vy: number, vx: number, now: number): void {
     const t = Math.max(-1, Math.min(1, vy / 900));
-    const sxs = 1 - t * 0.16;
-    const sys = 1 + t * 0.2;
-    const w = PLAYER_W * sxs;
-    const h = PLAYER_H * sys;
-    const x = cx - w / 2;
-    const y = feetY - h;
+    const w = PLAYER_W * (1 - t * 0.14) * 0.66;
+    const h = PLAYER_H * (1 + t * 0.2);
+    const lean = Math.max(-0.34, Math.min(0.34, vx / 900));
 
-    // Thruster, only while climbing.
-    if (vy > 60) {
-      const flame = 8 + Math.min(18, vy / 40) + Math.sin(now * 0.03) * 3;
-      const g = ctx.createLinearGradient(cx, feetY, cx, feetY + flame);
-      g.addColorStop(0, "rgba(95 242 255 / 0.9)");
-      g.addColorStop(1, "rgba(95 242 255 / 0)");
-      ctx.fillStyle = g;
+    ctx.save();
+    ctx.translate(cx, feetY);
+    ctx.rotate(lean);
+
+    // Damp halo around the nib.
+    ctx.fillStyle = ink(0.1);
+    ctx.beginPath();
+    ctx.ellipse(0, -h * 0.45, w * 0.85, h * 0.6, 0, 0, 7);
+    ctx.fill();
+
+    // The nib: a teardrop, point upward, belly low.
+    ctx.fillStyle = ink(0.94);
+    ctx.beginPath();
+    ctx.moveTo(0, -h);
+    ctx.bezierCurveTo(w * 0.52, -h * 0.62, w * 0.5, -h * 0.12, 0, 0);
+    ctx.bezierCurveTo(-w * 0.5, -h * 0.12, -w * 0.52, -h * 0.62, 0, -h);
+    ctx.closePath();
+    ctx.fill();
+
+    // A dry highlight along the shaft, so it reads as a brush and not a blob.
+    ctx.strokeStyle = `rgba(239 231 215 / 0.42)`;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(-w * 0.12, -h * 0.72);
+    ctx.lineTo(-w * 0.05, -h * 0.22);
+    ctx.stroke();
+
+    // Ink gathering at the tip while the jetpack burns.
+    if (vy > 700) {
+      ctx.fillStyle = ink(0.5);
       ctx.beginPath();
-      ctx.moveTo(cx - 6, feetY - 2);
-      ctx.lineTo(cx + 6, feetY - 2);
-      ctx.lineTo(cx, feetY + flame);
-      ctx.closePath();
+      ctx.ellipse(0, 3 + Math.sin(now * 0.02) * 1.5, w * 0.3, 4, 0, 0, 7);
       ctx.fill();
     }
 
-    glow(CYAN, 22);
-    ctx.fillStyle = "#eaffff";
-    // Hexagonal hull, nose up.
-    ctx.beginPath();
-    ctx.moveTo(cx, y);
-    ctx.lineTo(x + w, y + h * 0.32);
-    ctx.lineTo(x + w * 0.82, y + h);
-    ctx.lineTo(x + w * 0.18, y + h);
-    ctx.lineTo(x, y + h * 0.32);
-    ctx.closePath();
-    ctx.fill();
-    noGlow();
+    ctx.restore();
+  }
 
-    // The cannon. Nothing on screen says "press space", so the craft has to
-    // look armed: a muzzle on the nose, lit, pointing the way missiles go.
-    ctx.fillStyle = HOT;
-    glow(HOT, 12);
-    roundRect(cx - 2.5, y - 6, 5, 8, 2);
-    ctx.fill();
-    noGlow();
+  /**
+   * The stroke the nib is painting. Width follows speed, the tail thins to
+   * nothing, and the whole thing is split wherever the player crossed the
+   * seam — otherwise a wrap paints a stripe straight across the scroll.
+   */
+  function drawTrail(cameraY: number): void {
+    if (trail.length < 3) return;
 
-    // Cockpit.
-    ctx.fillStyle = "rgba(20 40 70 / 0.85)";
-    ctx.beginPath();
-    ctx.ellipse(cx, y + h * 0.5, w * 0.22, h * 0.17, 0, 0, Math.PI * 2);
-    ctx.fill();
+    let segment: { x: number; y: number; w: number }[] = [];
+    const segments: { x: number; y: number; w: number }[][] = [];
+    for (const point of trail) {
+      if (point.break && segment.length) {
+        segments.push(segment);
+        segment = [];
+      }
+      segment.push({ x: point.x, y: sy(point.worldY, cameraY), w: point.w });
+    }
+    if (segment.length) segments.push(segment);
+
+    for (const seg of segments) {
+      if (seg.length < 3) continue;
+      const n = seg.length;
+
+      // 收笔 — the lift-off — is most of what makes a mark read as a brush
+      // stroke rather than a line. But the taper has to stay gentle enough to
+      // leave a visible belly: at pow 2.1 the whole stroke became a needle,
+      // and the one wide part was hidden under the nib drawn on top of it.
+      const widthAt = (i: number) => {
+        const age = i / (n - 1); // 0 at tail, 1 at head
+        return seg[i]!.w * Math.pow(age, 1.25);
+      };
+
+      const normalAt = (i: number): [number, number] => {
+        const prev = seg[Math.max(0, i - 1)]!;
+        const next = seg[Math.min(n - 1, i + 1)]!;
+        const dx = next.x - prev.x;
+        const dy = next.y - prev.y;
+        const len = Math.hypot(dx, dy) || 1;
+        return [-dy / len, dx / len];
+      };
+
+      const path = (spread: number) => {
+        ctx.beginPath();
+        for (let i = 0; i < n; i++) {
+          const [nx, ny] = normalAt(i);
+          const w = (widthAt(i) * spread) / 2;
+          ctx.lineTo(seg[i]!.x + nx * w, seg[i]!.y + ny * w);
+        }
+        for (let i = n - 1; i >= 0; i--) {
+          const [nx, ny] = normalAt(i);
+          const w = (widthAt(i) * spread) / 2;
+          ctx.lineTo(seg[i]!.x - nx * w, seg[i]!.y - ny * w);
+        }
+        ctx.closePath();
+      };
+
+      // Damp bleed, then the wet body over it.
+      ctx.fillStyle = ink(0.09);
+      path(1.9);
+      ctx.fill();
+      ctx.fillStyle = ink(0.36);
+      path(1);
+      ctx.fill();
+    }
   }
 
   function drawMonster(x: number, y: number, phase: number, now: number): void {
     const cx = x + MONSTER_W / 2;
     const cy = y + MONSTER_H / 2;
-    const pulse = 0.75 + 0.25 * Math.sin(now * 0.005 + phase);
-    glow(HOT, 20 * pulse);
-    ctx.fillStyle = HOT;
-    // A spiked rotor: unmistakably hostile, and readable at a glance while
-    // you are falling toward it.
+    const pulse = 0.85 + 0.15 * Math.sin(now * 0.005 + phase);
+
+    // A splattered blot with flicked hairs — the one mark on the page that
+    // was not made carefully. Vermillion so danger reads instantly.
+    ctx.fillStyle = "rgba(176 58 42 / 0.14)";
     ctx.beginPath();
-    const spikes = 7;
-    for (let i = 0; i < spikes * 2; i++) {
-      const a = (i / (spikes * 2)) * Math.PI * 2 + now * 0.0012 + phase;
-      const r = i % 2 === 0 ? (MONSTER_W / 2) * pulse : MONSTER_W / 4;
-      ctx.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+    ctx.arc(cx, cy, MONSTER_W * 0.62 * pulse, 0, 7);
+    ctx.fill();
+
+    ctx.fillStyle = CINNABAR;
+    ctx.beginPath();
+    const lobes = 7;
+    for (let i = 0; i <= lobes * 2; i++) {
+      const a = (i / (lobes * 2)) * Math.PI * 2 + phase;
+      const r = (i % 2 === 0 ? MONSTER_W * 0.42 : MONSTER_W * 0.24) * pulse;
+      const jitter = 1 + (wobble(Math.round(phase * 100) + i, 3) - 0.5) * 0.35;
+      ctx.lineTo(cx + Math.cos(a) * r * jitter, cy + Math.sin(a) * r * jitter);
     }
     ctx.closePath();
     ctx.fill();
-    noGlow();
-    ctx.fillStyle = "#1a0410";
-    ctx.beginPath();
-    ctx.arc(cx, cy, MONSTER_W * 0.16, 0, Math.PI * 2);
-    ctx.fill();
+
+    // Flicked droplets.
+    ctx.fillStyle = "rgba(176 58 42 / 0.75)";
+    for (let i = 0; i < 5; i++) {
+      const a = phase + i * 1.7 + now * 0.0008;
+      const r = MONSTER_W * (0.6 + wobble(i, 9) * 0.35);
+      ctx.beginPath();
+      ctx.arc(cx + Math.cos(a) * r, cy + Math.sin(a) * r, 1.1 + wobble(i, 11) * 1.4, 0, 7);
+      ctx.fill();
+    }
   }
 
   function drawPickup(x: number, y: number, now: number): void {
+    // A cloud scroll — 祥云 — the traditional way of drawing "carried upward".
     const cx = x + 13;
-    const cy = y + 13;
-    const bob = Math.sin(now * 0.004) * 3;
-    glow(VIOLET, 20);
-    ctx.fillStyle = VIOLET;
-    ctx.beginPath();
-    for (let i = 0; i < 6; i++) {
-      const a = (i / 6) * Math.PI * 2 + now * 0.001;
-      ctx.lineTo(cx + Math.cos(a) * 11, cy + bob + Math.sin(a) * 11);
-    }
-    ctx.closePath();
-    ctx.fill();
-    noGlow();
-    ctx.strokeStyle = "#fff";
+    const cy = y + 13 + Math.sin(now * 0.004) * 3;
+    ctx.strokeStyle = ink(0.6);
     ctx.lineWidth = 2;
+    ctx.lineCap = "round";
     ctx.beginPath();
-    ctx.moveTo(cx, cy + bob + 5);
-    ctx.lineTo(cx, cy + bob - 5);
-    ctx.moveTo(cx - 3.5, cy + bob - 1.5);
-    ctx.lineTo(cx, cy + bob - 5);
-    ctx.lineTo(cx + 3.5, cy + bob - 1.5);
+    ctx.arc(cx - 5, cy, 6, Math.PI * 0.6, Math.PI * 1.9);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx + 5, cy - 2, 5, Math.PI * 0.5, Math.PI * 1.85);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - 10, cy + 5);
+    ctx.quadraticCurveTo(cx, cy + 9, cx + 10, cy + 3);
     ctx.stroke();
   }
 
   function drawSummit(screenY: number, now: number): void {
-    // The destination, drawn as a lit gate rather than a finish line: it
-    // should pull you upward from the moment it edges into view.
-    const g = ctx.createLinearGradient(0, screenY - 60, 0, screenY + 40);
-    g.addColorStop(0, "rgba(95 242 255 / 0)");
-    g.addColorStop(0.55, "rgba(95 242 255 / 0.35)");
-    g.addColorStop(1, "rgba(95 242 255 / 0)");
-    ctx.fillStyle = g;
-    ctx.fillRect(0, screenY - 60, WORLD_WIDTH, 100);
+    // A far peak, then the seal that finishes a painting.
+    ctx.fillStyle = ink(0.24);
+    ctx.beginPath();
+    ctx.moveTo(-20, screenY + 40);
+    ctx.lineTo(WORLD_WIDTH * 0.3, screenY - 46);
+    ctx.lineTo(WORLD_WIDTH * 0.42, screenY - 8);
+    ctx.lineTo(WORLD_WIDTH * 0.58, screenY - 62);
+    ctx.lineTo(WORLD_WIDTH * 0.78, screenY - 6);
+    ctx.lineTo(WORLD_WIDTH + 20, screenY + 40);
+    ctx.closePath();
+    ctx.fill();
 
-    glow(CYAN, 26);
-    ctx.strokeStyle = "#eaffff";
-    ctx.lineWidth = 3;
+    ctx.strokeStyle = ink(0.5);
+    ctx.lineWidth = 1.6;
     ctx.beginPath();
-    ctx.moveTo(0, screenY);
-    ctx.lineTo(WORLD_WIDTH, screenY);
+    ctx.moveTo(0, screenY + 40);
+    ctx.quadraticCurveTo(WORLD_WIDTH / 2, screenY + 24, WORLD_WIDTH, screenY + 40);
     ctx.stroke();
-    const r = 46 + Math.sin(now * 0.003) * 5;
-    ctx.beginPath();
-    ctx.arc(WORLD_WIDTH / 2, screenY, r, Math.PI, Math.PI * 2);
-    ctx.stroke();
-    noGlow();
+
+    const s = 20 + Math.sin(now * 0.003) * 1.5;
+    ctx.fillStyle = "rgba(176 58 42 / 0.9)";
+    ctx.fillRect(WORLD_WIDTH / 2 - s, screenY - 18 - s, s * 2, s * 2);
+    ctx.fillStyle = PAPER;
+    ctx.font = `700 ${Math.round(s * 1.1)}px serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("頂", WORLD_WIDTH / 2, screenY - 17);
+    ctx.textBaseline = "alphabetic";
+    ctx.textAlign = "left";
   }
 
-  function drawSky(progress: number, cameraY: number, now: number): void {
-    const { top, bottom } = skyAt(progress);
-    const g = ctx.createLinearGradient(0, 0, 0, VIEW_HEIGHT);
-    g.addColorStop(0, top);
-    g.addColorStop(1, bottom);
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, WORLD_WIDTH, VIEW_HEIGHT);
+  /**
+   * The scroll behind everything. Ink thins as you climb: near ranges drop
+   * away, far ones pale into mist, and the top of the painting is bare paper.
+   * 留白 is the progress bar.
+   */
+  function drawScroll(progress: number, cameraY: number): void {
+    ctx.drawImage(paper, 0, 0);
 
-    // Stars fade in with altitude and are tiled per layer.
-    const starAlpha = Math.max(0, Math.min(1, (progress - 0.18) / 0.45));
-    if (starAlpha > 0) {
-      for (const layer of layers) {
-        ctx.fillStyle = `rgba(255 255 255 / ${starAlpha * layer.alpha})`;
-        const shift = (cameraY * layer.factor) % VIEW_HEIGHT;
-        for (const s of layer.stars) {
-          let y = (s.y + shift) % VIEW_HEIGHT;
-          if (y < 0) y += VIEW_HEIGHT;
-          const tw = 0.6 + 0.4 * Math.sin(now * 0.002 + s.twinkle);
-          ctx.beginPath();
-          ctx.arc(s.x, y, s.r * tw, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      }
-    }
+    const ranges = [
+      { factor: 0.34, base: 120, height: 190, alpha: 0.46, seed: 1.7, crag: 1 },
+      { factor: 0.16, base: 40, height: 250, alpha: 0.26, seed: 5.1, crag: 0.6 },
+      { factor: 0.07, base: 0, height: 300, alpha: 0.13, seed: 9.4, crag: 0.35 },
+    ];
 
-    // A nebula smear once you are properly out of the air.
-    if (progress > 0.7) {
-      const a = Math.min(0.5, (progress - 0.7) / 0.3) * 0.5;
-      const neb = ctx.createRadialGradient(
-        WORLD_WIDTH * 0.7,
-        VIEW_HEIGHT * 0.3,
-        10,
-        WORLD_WIDTH * 0.7,
-        VIEW_HEIGHT * 0.3,
-        320,
-      );
-      neb.addColorStop(0, `rgba(199 125 255 / ${a})`);
-      neb.addColorStop(1, "rgba(199 125 255 / 0)");
-      ctx.fillStyle = neb;
-      ctx.fillRect(0, 0, WORLD_WIDTH, VIEW_HEIGHT);
-    }
+    for (const [index, range] of ranges.entries()) {
+      // Nearer ranges leave the frame sooner, and everything fades as the air
+      // thins — by the summit the page is almost empty.
+      const fade = Math.max(0, 1 - progress / (0.45 + index * 0.28));
+      if (fade <= 0.01) continue;
 
-    // City silhouette, only while the ground is still close.
-    const cityAlpha = Math.max(0, 1 - cameraY / 900);
-    if (cityAlpha > 0.01) {
-      ctx.fillStyle = `rgba(4 6 20 / ${cityAlpha})`;
-      let x = 0;
-      let seed = 5;
-      const rand = () => {
-        seed = (seed * 1_664_525 + 1_013_904_223) >>> 0;
-        return seed / 0x1_0000_0000;
+      const footY = sy(range.base, cameraY * range.factor);
+      if (footY < -range.height) continue;
+
+      // Layered sines at unrelated frequencies, so the ridge never repeats
+      // and never falls into a rhythm. The first attempt alternated tall and
+      // short peaks at even spacing and came out as a row of identical
+      // triangles — geometry, not a mountain.
+      const ridge = (t: number): number => {
+        const s = range.seed;
+        const rolling =
+          Math.sin(t * 5.3 + s) * 0.44 +
+          Math.sin(t * 11.7 + s * 2.1) * 0.24 +
+          Math.sin(t * 23.3 + s * 3.7) * 0.12 +
+          Math.sin(t * 41.9 + s * 5.3) * 0.06 * range.crag;
+        // Bias upward so the range sits mostly high, with dips rather than
+        // spikes — distant ink mountains read as mass, not as teeth.
+        return 0.58 + rolling * 0.42;
       };
-      while (x < WORLD_WIDTH) {
-        const w = 24 + rand() * 44;
-        const h = 40 + rand() * 120;
-        const baseY = VIEW_HEIGHT + cameraY;
-        ctx.fillRect(x, baseY - h, w, h + 10);
-        x += w + 6;
+
+      // Ink is heaviest at the foot and bleeds out toward the ridge.
+      const wash = ctx.createLinearGradient(0, footY - range.height, 0, footY + 40);
+      wash.addColorStop(0, ink(range.alpha * fade * 0.25));
+      wash.addColorStop(0.55, ink(range.alpha * fade * 0.85));
+      wash.addColorStop(1, ink(range.alpha * fade));
+      ctx.fillStyle = wash;
+
+      ctx.beginPath();
+      ctx.moveTo(-10, VIEW_HEIGHT + 10);
+      ctx.lineTo(-10, footY);
+      const samples = 74;
+      for (let i = 0; i <= samples; i++) {
+        const t = i / samples;
+        ctx.lineTo(-10 + (WORLD_WIDTH + 20) * t, footY - range.height * ridge(t));
       }
+      ctx.lineTo(WORLD_WIDTH + 10, footY);
+      ctx.lineTo(WORLD_WIDTH + 10, VIEW_HEIGHT + 10);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // Mist: bands of bare paper laid back over the ranges.
+    for (let i = 0; i < 3; i++) {
+      const bandY = ((cameraY * 0.09 + i * 260) % (VIEW_HEIGHT + 300)) - 150;
+      const screenBand = VIEW_HEIGHT - bandY;
+      const g = ctx.createLinearGradient(0, screenBand - 46, 0, screenBand + 46);
+      g.addColorStop(0, "rgba(239 231 215 / 0)");
+      g.addColorStop(0.5, `rgba(239 231 215 / ${0.72 - progress * 0.3})`);
+      g.addColorStop(1, "rgba(239 231 215 / 0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, screenBand - 46, WORLD_WIDTH, 92);
     }
   }
 
   function drawHud(state: GameState, progress: number): void {
-    // The only text during play is a number. A label would be an
-    // instruction, and the sky already says which way is forward.
     const metres = Math.round(progressY(state) / 10);
     const label = `${metres}`;
-    ctx.textAlign = "left";
-    ctx.font = "600 26px ui-monospace, SFMono-Regular, Menlo, monospace";
-    // Measure under the font that will draw it, then place the unit past the
-    // end of it. Guessing at a multiple of the width put the M inside the
-    // digits at three figures and on top of them at two.
-    const numberWidth = ctx.measureText(label).width;
-    ctx.fillStyle = "rgba(255 255 255 / 0.92)";
-    glow("rgba(95 242 255 / 0.8)", 14);
-    ctx.fillText(label, 18, 40);
-    noGlow();
-    ctx.font = "500 11px ui-monospace, SFMono-Regular, Menlo, monospace";
-    ctx.fillStyle = "rgba(255 255 255 / 0.45)";
-    ctx.fillText("M", 18 + numberWidth + 5, 40);
 
-    // A track up the right edge: wordless proof there is a top to reach.
-    const trackX = WORLD_WIDTH - 14;
-    const top = 60;
-    const bottom = VIEW_HEIGHT - 60;
-    ctx.strokeStyle = "rgba(255 255 255 / 0.28)";
-    ctx.lineWidth = 3;
+    ctx.textAlign = "left";
+    ctx.font = '600 26px "Songti SC", "Noto Serif CJK SC", Georgia, serif';
+    const width = ctx.measureText(label).width;
+    ctx.fillStyle = ink(0.82);
+    ctx.fillText(label, 20, 42);
+    ctx.font = '400 12px "Songti SC", "Noto Serif CJK SC", Georgia, serif';
+    ctx.fillStyle = ink(0.45);
+    ctx.fillText("丈", 20 + width + 6, 42);
+
+    // The climb as a brush stroke up the right edge: bare paper above, ink
+    // below. No label, because a label would be an instruction.
+    const trackX = WORLD_WIDTH - 16;
+    const top = 64;
+    const bottom = VIEW_HEIGHT - 64;
+    ctx.strokeStyle = ink(0.14);
+    ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.moveTo(trackX, top);
     ctx.lineTo(trackX, bottom);
     ctx.stroke();
 
-    ctx.strokeStyle = CYAN;
-    glow(CYAN, 10);
+    const head = lerp(bottom, top, Math.min(1, progress));
+    ctx.strokeStyle = ink(0.62);
+    ctx.lineWidth = 3.4;
+    ctx.lineCap = "round";
     ctx.beginPath();
     ctx.moveTo(trackX, bottom);
-    ctx.lineTo(trackX, lerp(bottom, top, Math.min(1, progress)));
+    ctx.lineTo(trackX, head);
     ctx.stroke();
-    noGlow();
+    ctx.fillStyle = ink(0.7);
+    ctx.beginPath();
+    ctx.arc(trackX, head, 2.6, 0, 7);
+    ctx.fill();
   }
 
   function drawEnding(state: GameState, now: number): void {
     const won = state.status === "won";
-    ctx.fillStyle = won ? "rgba(4 20 30 / 0.72)" : "rgba(20 4 12 / 0.72)";
+    ctx.fillStyle = "rgba(239 231 215 / 0.84)";
     ctx.fillRect(0, 0, WORLD_WIDTH, VIEW_HEIGHT);
 
     const cx = WORLD_WIDTH / 2;
     const cy = VIEW_HEIGHT / 2;
-    const accent = won ? CYAN : HOT;
 
-    glow(accent, 30);
-    ctx.strokeStyle = accent;
-    ctx.lineWidth = 2.5;
-    ctx.beginPath();
-    ctx.arc(cx, cy - 54, 34 + Math.sin(now * 0.004) * 3, 0, Math.PI * 2);
-    ctx.stroke();
-    noGlow();
+    // A single wet stroke, brushed across, then the seal beneath it.
+    ctx.save();
+    ctx.translate(cx - 120, cy - 96);
+    stroke(0, 0, 240, won ? 20 : 13, won ? 0.88 : 0.5, won ? 0 : 1, won ? 2 : 9);
+    ctx.restore();
 
     ctx.textAlign = "center";
-    ctx.fillStyle = "#fff";
-    ctx.font = "700 15px ui-monospace, SFMono-Regular, Menlo, monospace";
-    ctx.fillText(won ? "SUMMIT" : "FELL", cx, cy - 48);
+    ctx.fillStyle = ink(0.86);
+    ctx.font = '700 44px "Songti SC", "Noto Serif CJK SC", Georgia, serif';
+    ctx.fillText(won ? "登頂" : "墜", cx, cy - 30);
 
-    ctx.font = "700 54px ui-monospace, SFMono-Regular, Menlo, monospace";
-    glow(accent, 18);
-    ctx.fillText(`${Math.round(progressY(state) / 10)}`, cx, cy + 30);
-    noGlow();
-    ctx.font = "500 12px ui-monospace, SFMono-Regular, Menlo, monospace";
-    ctx.fillStyle = "rgba(255 255 255 / 0.5)";
-    ctx.fillText("METRES", cx, cy + 52);
+    ctx.font = '600 58px "Songti SC", "Noto Serif CJK SC", Georgia, serif';
+    ctx.fillStyle = ink(0.8);
+    ctx.fillText(`${Math.round(progressY(state) / 10)}`, cx, cy + 44);
+    ctx.font = '400 13px "Songti SC", "Noto Serif CJK SC", Georgia, serif';
+    ctx.fillStyle = ink(0.45);
+    ctx.fillText("丈", cx, cy + 66);
 
-    // Restart affordance: a glyph, not a sentence.
-    const pulse = 0.5 + 0.5 * Math.sin(now * 0.005);
-    ctx.strokeStyle = `rgba(255 255 255 / ${0.35 + pulse * 0.45})`;
-    ctx.lineWidth = 2;
+    // The seal: red, square, and the only saturated thing on the page.
+    const s = 26;
+    ctx.fillStyle = "rgba(176 58 42 / 0.92)";
+    ctx.fillRect(cx - s / 2, cy + 92, s, s);
+    ctx.fillStyle = PAPER;
+    ctx.font = '700 17px "Songti SC", "Noto Serif CJK SC", Georgia, serif';
+    ctx.textBaseline = "middle";
+    ctx.fillText(won ? "成" : "再", cx, cy + 92 + s / 2 + 1);
+    ctx.textBaseline = "alphabetic";
+
+    // Restart affordance: a brushed circle, drawn as if still wet.
+    const pulse = 0.45 + 0.55 * Math.abs(Math.sin(now * 0.0022));
+    ctx.strokeStyle = ink(0.16 + pulse * 0.3);
+    ctx.lineWidth = 2.2;
+    ctx.lineCap = "round";
     ctx.beginPath();
-    ctx.arc(cx, cy + 108, 15, 0.6, Math.PI * 1.75);
+    ctx.arc(cx, cy + 92 + s / 2, 30, 0.5, Math.PI * 1.82);
     ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(cx + 12, cy + 96);
-    ctx.lineTo(cx + 16, cy + 105);
-    ctx.lineTo(cx + 6, cy + 104);
-    ctx.closePath();
-    ctx.fillStyle = `rgba(255 255 255 / ${0.35 + pulse * 0.45})`;
-    ctx.fill();
     ctx.textAlign = "left";
   }
 
   function draw(state: GameState, now: number): void {
     const cameraY = state.cameraY;
     const progress = Math.min(1, progressY(state) / SUMMIT_Y);
+    const p = state.player;
 
-    // The stage is letterboxed on anything wider than 2:3, and drawing is
-    // clipped to it — so the surround has to be painted every frame or it
-    // keeps whatever was there last.
-    ctx.fillStyle = "#04050c";
+    ctx.fillStyle = PAPER_DEEP;
     ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
 
     ctx.save();
     ctx.translate(offsetX, offsetY);
     ctx.scale(scale, scale);
-
-    // Clip to the stage so glow never bleeds into the letterbox.
     ctx.beginPath();
     ctx.rect(0, 0, WORLD_WIDTH, VIEW_HEIGHT);
     ctx.clip();
 
-    // Landing shake, decayed here rather than stored in the game.
-    const bounced = state.player.vy > 200 && lastVy < 0;
+    const bounced = p.vy > 200 && lastVy < 0;
     if (bounced) {
-      shake = Math.min(7, 3 + state.player.vy / 260);
-      burst(state.player.x, sy(state.player.y, cameraY), CYAN, 12, 170);
+      shake = Math.min(6, 2.5 + p.vy / 300);
+      const at = sy(p.y, cameraY);
+      for (let i = 0; i < 9; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const sp = 60 + Math.random() * 110;
+        particles.push({
+          x: p.x,
+          y: at,
+          vx: Math.cos(a) * sp,
+          vy: -Math.abs(Math.sin(a)) * sp * 0.5,
+          life: 1,
+          maxLife: 0.35 + Math.random() * 0.4,
+          size: 0.9 + Math.random() * 2,
+        });
+      }
     }
-    lastVy = state.player.vy;
-    shake *= 0.86;
+    lastVy = p.vy;
+    shake *= 0.85;
     if (shake > 0.2) {
       ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
     }
 
-    drawSky(progress, cameraY, now);
+    drawScroll(progress, cameraY);
 
-    if (SUMMIT_Y - cameraY < VIEW_HEIGHT + 120) {
-      drawSummit(sy(SUMMIT_Y, cameraY), now);
-    }
+    if (SUMMIT_Y - cameraY < VIEW_HEIGHT + 140) drawSummit(sy(SUMMIT_Y, cameraY), now);
 
-    for (const p of state.platforms) {
-      if (!p.alive) continue;
-      const y = sy(p.y, cameraY);
+    // Record the brush trail in screen space. Width follows speed, which is
+    // what makes acceleration legible as a thickening stroke.
+    const feet = sy(p.y, cameraY);
+    const speed = Math.hypot(p.vx, p.vy * 0.55);
+    const wrapped = Math.abs(p.x - lastX) > WORLD_WIDTH / 2;
+    trail.push({
+      x: p.x,
+      worldY: p.y + PLAYER_H * 0.35,
+      // Speed is the whole point of the request: the faster the nib travels,
+      // the more it presses, the wider the mark it leaves.
+      w: Math.min(17, 2.4 + (speed / 420) * 10.5),
+      break: wrapped,
+    });
+    lastX = p.x;
+    // Shorter than it was: a long tail turned every climb into one continuous
+    // ribbon, and a stroke needs an end to read as a stroke.
+    if (trail.length > 19) trail.shift();
+
+    drawTrail(cameraY);
+
+    for (const plat of state.platforms) {
+      if (!plat.alive) continue;
+      const y = sy(plat.y, cameraY);
       if (y < -40 || y > VIEW_HEIGHT + 40) continue;
-      drawPlatform(p.x, y, p.kind, now);
+      drawPlatform(plat, y, now);
     }
 
     for (const pick of state.pickups) {
@@ -569,42 +697,40 @@ export function createRenderer(canvas: HTMLCanvasElement): Renderer {
       drawMonster(mon.x, y - MONSTER_H, mon.driftPhase, now);
     }
 
-    glow(HOT, 14);
-    ctx.fillStyle = "#ffd9e4";
+    // Missiles: flicked droplets of ink.
+    ctx.fillStyle = ink(0.72);
     for (const m of state.missiles) {
       const y = sy(m.y, cameraY);
       if (y < -20 || y > VIEW_HEIGHT + 20) continue;
-      roundRect(m.x - 2.5, y - 12, 5, 14, 2.5);
+      ctx.beginPath();
+      ctx.ellipse(m.x, y - 5, 2.6, 6.5, 0, 0, 7);
       ctx.fill();
+      ctx.fillStyle = ink(0.2);
+      ctx.beginPath();
+      ctx.arc(m.x, y + 6, 1.6, 0, 7);
+      ctx.fill();
+      ctx.fillStyle = ink(0.72);
     }
-    noGlow();
 
-    // Particles.
     for (let i = particles.length - 1; i >= 0; i--) {
-      const p = particles[i]!;
-      p.life -= 0.016 / p.maxLife;
-      if (p.life <= 0) {
+      const part = particles[i]!;
+      part.life -= 0.016 / part.maxLife;
+      if (part.life <= 0) {
         particles.splice(i, 1);
         continue;
       }
-      p.x += p.vx * 0.016;
-      p.y += p.vy * 0.016;
-      p.vy += 320 * 0.016;
-      ctx.globalAlpha = Math.max(0, p.life);
-      ctx.fillStyle = p.hue;
+      part.x += part.vx * 0.016;
+      part.y += part.vy * 0.016;
+      part.vy += 280 * 0.016;
+      ctx.fillStyle = ink(0.4 * part.life);
       ctx.beginPath();
-      ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+      ctx.arc(part.x, part.y, part.size * part.life, 0, 7);
       ctx.fill();
     }
-    ctx.globalAlpha = 1;
 
-    // The craft, drawn twice near the edges so wrapping reads as continuous.
-    const feet = sy(state.player.y, cameraY);
-    drawCraft(state.player.x, feet, state.player.vy, now);
-    if (state.player.x < PLAYER_W) drawCraft(state.player.x + WORLD_WIDTH, feet, state.player.vy, now);
-    if (state.player.x > WORLD_WIDTH - PLAYER_W) {
-      drawCraft(state.player.x - WORLD_WIDTH, feet, state.player.vy, now);
-    }
+    drawNib(p.x, feet, p.vy, p.vx, now);
+    if (p.x < PLAYER_W) drawNib(p.x + WORLD_WIDTH, feet, p.vy, p.vx, now);
+    if (p.x > WORLD_WIDTH - PLAYER_W) drawNib(p.x - WORLD_WIDTH, feet, p.vy, p.vx, now);
 
     if (state.status === "playing") drawHud(state, progress);
     else drawEnding(state, now);
