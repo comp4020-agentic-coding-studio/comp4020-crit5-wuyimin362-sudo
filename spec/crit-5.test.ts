@@ -1,10 +1,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  BOUNCE_HEIGHT,
   createGame,
+  ensureGenerated,
   makeRng,
   resetCooldown,
   SUMMIT_Y,
   step,
+  TUNING,
   type GameState,
   type Input,
 } from "../game.ts";
@@ -181,5 +184,56 @@ describe("the opening teaches itself", () => {
     expect(broken, "the lesson has to be on screen early").toBeTruthy();
     const neighbour = opening.find((p) => p.kind === "solid" && Math.abs(p.y - broken!.y) < 60);
     expect(neighbour, "shown against a solid one, so the contrast is the teacher").toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sensors, not contracts. Every one of these was a bug first: the climb built
+// walls it could not clear and the run ended in neither a win nor a loss, it
+// just went on. "Play ends somewhere" is a promise about the generated world,
+// not only about the two status transitions, so the world gets checked too.
+//
+// These stay when crit 5 goes — the rules above retire with the brief, but a
+// generator that can wall itself in is worth catching in any week.
+// ---------------------------------------------------------------------------
+describe("the mountain is always climbable", () => {
+  const seeds = [1, 7, 1000, 24_757, 88_109, 20_260_902];
+
+  it.each(seeds)("seed %i never leaves a gap taller than one bounce", (seed) => {
+    const state = createGame(seed);
+    ensureGenerated(state, SUMMIT_Y);
+
+    const rungs = state.platforms
+      .filter((p) => p.kind !== "broken")
+      .sort((a, b) => a.y - b.y);
+
+    expect(rungs.length).toBeGreaterThan(50);
+    for (let i = 1; i < rungs.length; i++) {
+      const gap = rungs[i]!.y - rungs[i - 1]!.y;
+      expect(
+        gap,
+        `rungs at ${rungs[i - 1]!.y.toFixed(0)} and ${rungs[i]!.y.toFixed(0)} are ${gap.toFixed(
+          0,
+        )} apart, past the ${BOUNCE_HEIGHT.toFixed(0)} a bounce buys`,
+      ).toBeLessThan(BOUNCE_HEIGHT);
+    }
+  });
+
+  it.each(seeds)("seed %i never parks a monster on a landable platform", (seed) => {
+    const state = createGame(seed);
+    ensureGenerated(state, SUMMIT_Y);
+
+    for (const rung of state.platforms.filter((p) => p.kind !== "broken")) {
+      for (const monster of state.monsters) {
+        if (Math.abs(monster.y - rung.y) >= 40) continue;
+        const overlapping =
+          monster.x < rung.x + TUNING.PLATFORM_W && monster.x + TUNING.MONSTER_W > rung.x;
+        expect(
+          overlapping,
+          `a monster at ${monster.y.toFixed(0)} sits across the rung at ${rung.y.toFixed(0)}, ` +
+            "which can leave the only route up guarded by something fatal",
+        ).toBe(false);
+      }
+    }
   });
 });

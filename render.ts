@@ -429,21 +429,26 @@ export function createRenderer(canvas: HTMLCanvasElement): Renderer {
     // The only text during play is a number. A label would be an
     // instruction, and the sky already says which way is forward.
     const metres = Math.round(progressY(state) / 10);
-    ctx.font = "600 26px ui-monospace, SFMono-Regular, Menlo, monospace";
+    const label = `${metres}`;
     ctx.textAlign = "left";
+    ctx.font = "600 26px ui-monospace, SFMono-Regular, Menlo, monospace";
+    // Measure under the font that will draw it, then place the unit past the
+    // end of it. Guessing at a multiple of the width put the M inside the
+    // digits at three figures and on top of them at two.
+    const numberWidth = ctx.measureText(label).width;
     ctx.fillStyle = "rgba(255 255 255 / 0.92)";
     glow("rgba(95 242 255 / 0.8)", 14);
-    ctx.fillText(`${metres}`, 18, 40);
+    ctx.fillText(label, 18, 40);
     noGlow();
     ctx.font = "500 11px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.fillStyle = "rgba(255 255 255 / 0.45)";
-    ctx.fillText("M", 20 + ctx.measureText(`${metres}`).width * 1.9, 40);
+    ctx.fillText("M", 18 + numberWidth + 5, 40);
 
     // A track up the right edge: wordless proof there is a top to reach.
-    const trackX = WORLD_WIDTH - 12;
+    const trackX = WORLD_WIDTH - 14;
     const top = 60;
     const bottom = VIEW_HEIGHT - 60;
-    ctx.strokeStyle = "rgba(255 255 255 / 0.14)";
+    ctx.strokeStyle = "rgba(255 255 255 / 0.28)";
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.moveTo(trackX, top);

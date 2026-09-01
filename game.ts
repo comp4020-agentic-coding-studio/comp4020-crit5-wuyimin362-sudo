@@ -16,8 +16,16 @@ export type Input = { left: boolean; right: boolean; fire: boolean };
 export const WORLD_WIDTH = 480;
 export const VIEW_HEIGHT = 720;
 
-/** Altitude that ends the run as a win. Tuned so a first climb runs 3–4 min. */
-export const SUMMIT_Y = 12_000;
+/**
+ * Altitude that ends the run as a win.
+ *
+ * Not guessed: scripts/sim.ts autoplays 24 seeds and reports time-to-summit.
+ * At 12,000 a competent run finished in 52s, which fails the half of the
+ * brief asking for something still interesting at five minutes. 24,000 puts
+ * the autoplayer near two minutes, and it is slower than that floor for a
+ * human still learning which platforms hold.
+ */
+export const SUMMIT_Y = 24_000;
 
 const GRAVITY = -1800; // px/s², pulling toward y = 0
 const BOUNCE_V = 780; // upward speed a solid platform returns
@@ -137,24 +145,43 @@ function seedOpening(state: GameState): void {
     state.platforms.push({ id: state.nextId++, x, y, kind, alive: true });
   };
 
+  // Every gap here is under the 169px a bounce buys, and the geometry is
+  // checked by spec/crit-5.test.ts rather than by eye — the first draft put
+  // the second platform 180px up and the player could not leave the ground.
   add(mid - PLATFORM_W, 80, "solid"); // double-wide start, hard to miss
-  add(mid, 80, "solid");
-  add(mid - PLATFORM_W / 2, 260, "solid"); // the invitation: straight up
-  add(60, 440, "solid"); // the lesson: solid and broken, side by side
-  add(WORLD_WIDTH - 60 - PLATFORM_W, 470, "broken");
-  add(mid - PLATFORM_W / 2, 640, "solid"); // recovery, so the lesson isn't fatal
+  add(mid, 80, "solid"); //             spans x 156..324
+  add(mid - PLATFORM_W / 2, 210, "solid"); // the invitation: straight up
+  add(130, 340, "solid"); // the lesson: a solid one...
+  add(250, 366, "broken"); // ...and a broken one right beside it
+  add(mid - PLATFORM_W / 2, 470, "solid"); // the reward for reading it right
 
-  state.generatedTo = 760;
+  // Falling through that broken platform drops the player back onto the
+  // double-wide start ledge, which is deliberately wide enough to catch them:
+  // the lesson costs about 280px of climb, not the run.
+  state.generatedTo = 470;
 }
 
+/** How far a bounce off a solid platform lifts you. The ladder depends on it. */
+export const BOUNCE_HEIGHT = (BOUNCE_V * BOUNCE_V) / (2 * -GRAVITY);
+
 /**
- * Platforms thin out and hazards arrive with altitude. Difficulty is a
- * function of height, not of a level table, so the curve is one number to
- * tune after actually playing it.
+ * Hazards arrive with altitude, and difficulty is a function of height rather
+ * than of a level table — so the curve is a couple of numbers to tune after
+ * actually playing it, not a data file to rewrite.
+ *
+ * Exported because the spec asserts a property of the world this builds:
+ * consecutive landable platforms must stay within one bounce of each other.
  */
-function generateTo(state: GameState, targetY: number): void {
+export function ensureGenerated(state: GameState, targetY: number): void {
   while (state.generatedTo < targetY) {
-    const y = state.generatedTo + 110 + state.rng() * 60;
+    // A solid bounce lifts exactly BOUNCE_V^2 / 2g — 169px at the current
+    // tuning — so the gap has to stay comfortably under that. The first
+    // version generated 110..170 and produced climbs that simply ended at a
+    // wall: the autoplayer neither won nor died on any of 24 seeds, it just
+    // bounced in place until the clock ran out. An unreachable gap is not
+    // difficulty, it is a dead end, so difficulty lives in what fills the
+    // gaps instead.
+    const y = state.generatedTo + 92 + state.rng() * 46;
     if (y > SUMMIT_Y) {
       state.generatedTo = targetY;
       return;
@@ -163,24 +190,102 @@ function generateTo(state: GameState, targetY: number): void {
     const progress = Math.min(1, y / SUMMIT_Y);
     const x = state.rng() * (WORLD_WIDTH - PLATFORM_W);
 
-    // Broken platforms climb from rare to common; trampolines stay a treat.
-    const roll = state.rng();
-    let kind: PlatformKind = "solid";
-    if (roll < 0.06 + progress * 0.02) kind = "trampoline";
-    else if (roll < 0.06 + progress * 0.36) kind = "broken";
+    // Every rung of the ladder is landable. Broken platforms used to take
+    // their turn in this sequence, and two in a row built a wall taller than
+    // a bounce: a traced run sat at 1756 forever, reaching 1925 with the next
+    // solid platform at 1948. The climb has to stay possible, so a broken
+    // platform is never a rung — it is a decoy placed beside one, which is
+    // also how the hand-placed opening teaches it.
+    // The rung below, so the corridor between the two can be kept clear.
+    const previous = state.platforms.filter((p) => p.kind !== "broken").at(-1);
 
+    const kind: PlatformKind = state.rng() < 0.06 + progress * 0.02 ? "trampoline" : "solid";
     state.platforms.push({ id: state.nextId++, x, y, kind, alive: true });
 
-    // Monsters from a quarter of the way up, never on the same row as the
-    // platform that gets you there.
-    if (progress > 0.22 && state.rng() < 0.1 + progress * 0.14) {
-      state.monsters.push({
+    // Two prunes, and both exist because generation runs bottom-up: when a
+    // monster is placed, the rung above it does not exist yet, so the check at
+    // its own placement cannot catch every case.
+    //
+    // The first keeps a rung landable along its whole length. The second
+    // keeps the route between consecutive rungs open — a monster parked in
+    // that corridor can wall the climb in, and the spec promises play ends
+    // somewhere, which a player bouncing in place forever does not do. A
+    // monster nobody has seen yet costs nothing to discard, so anything in
+    // the way is dropped rather than worked around.
+    const corridorLo = previous ? Math.min(previous.y, y) - 10 : y - 10;
+    const corridorHi = y + 10;
+    const corridorLeft = (previous ? Math.min(previous.x, x) : x) - 26;
+    const corridorRight = (previous ? Math.max(previous.x, x) : x) + PLATFORM_W + 26;
+
+    state.monsters = state.monsters.filter((m) => {
+      const onThisRung =
+        Math.abs(m.y - y) < 64 && m.x < x + PLATFORM_W + 20 && m.x + MONSTER_W > x - 20;
+      const inCorridor =
+        m.y > corridorLo &&
+        m.y < corridorHi &&
+        m.x < corridorRight &&
+        m.x + MONSTER_W > corridorLeft;
+      return !onThisRung && !inCorridor;
+    });
+
+    // The decoy: same height band, opposite half of the screen, so telling
+    // them apart is a choice rather than a dead end. Commoner as you climb.
+    if (state.rng() < 0.14 + progress * 0.5) {
+      const half = WORLD_WIDTH / 2;
+      const onLeft = x + PLATFORM_W / 2 < half;
+      const decoyX = onLeft
+        ? half + 10 + state.rng() * (half - PLATFORM_W - 10)
+        : state.rng() * (half - PLATFORM_W - 10);
+      state.platforms.push({
         id: state.nextId++,
-        x: state.rng() * (WORLD_WIDTH - MONSTER_W),
-        y: y + 60,
+        x: Math.max(0, Math.min(WORLD_WIDTH - PLATFORM_W, decoyX)),
+        y: y + (state.rng() - 0.5) * 44,
+        kind: "broken",
         alive: true,
-        driftPhase: state.rng() * Math.PI * 2,
       });
+    }
+
+    // Monsters from a quarter of the way up, and never in the column the
+    // player is about to fly through. The first version dropped them 60px
+    // above a platform with a random x — but a bounce rises 169px straight
+    // up, so any monster over the platform you just used was unavoidable
+    // death. The autoplayer stopped dead at the altitude they started
+    // appearing: every route was a trap, so it refused them all.
+    //
+    // Placing them half a world away horizontally makes them honest. They
+    // are still in the way whenever the next platform is over on their side,
+    // which is difficulty you can read and route around, and the promise
+    // that a monster can be outrun stays true.
+    if (progress > 0.22 && state.rng() < 0.1 + progress * 0.14) {
+      const platCentre = x + PLATFORM_W / 2;
+      const away =
+        (platCentre + WORLD_WIDTH / 2 + (state.rng() - 0.5) * 110 + WORLD_WIDTH) % WORLD_WIDTH;
+      const mx = Math.max(0, Math.min(WORLD_WIDTH - MONSTER_W, away - MONSTER_W / 2));
+      const my = y + 80 + state.rng() * 50;
+
+      // Half a world from *its own* rung still leaves it free to settle on a
+      // neighbouring one. A traced stall found exactly that: a monster at
+      // y=7328 parked across the platform at y=7323, which was the only thing
+      // in reach, so the climb had nowhere left to go. A rung has to stay
+      // landable along its whole length, so a monster that would sit on one
+      // is dropped rather than nudged.
+      const sitsOnARung = state.platforms.some(
+        (plat) =>
+          plat.kind !== "broken" &&
+          Math.abs(plat.y - my) < 64 &&
+          mx < plat.x + PLATFORM_W + 20 &&
+          mx + MONSTER_W > plat.x - 20,
+      );
+
+      if (!sitsOnARung) {
+        state.monsters.push({
+          id: state.nextId++,
+          x: mx,
+          y: my,
+          alive: true,
+          driftPhase: state.rng() * Math.PI * 2,
+        });
+      }
     }
 
     if (state.rng() < 0.035) {
@@ -220,7 +325,7 @@ export function createGame(seed = 20_260_902): GameState {
   };
 
   seedOpening(state);
-  generateTo(state, VIEW_HEIGHT * 2);
+  ensureGenerated(state, VIEW_HEIGHT * 2);
   // The player starts mid-bounce: motion on frame one says "this is automatic".
   state.player.vy = BOUNCE_V * 0.55;
   return state;
@@ -302,6 +407,13 @@ export function step(state: GameState, input: Input, dt: number): GameState {
         mon.alive = false;
         m.y = Number.POSITIVE_INFINITY; // culled below
         state.bonusY += KILL_BONUS;
+        // A kill leaves a jetpack behind. Without this, firing paid nothing
+        // an autoplayer could measure — 24 seeds finished in exactly the same
+        // time whether it shot or not, which made "shooting is the hidden
+        // layer" a claim with no substance under it. Now the reward is
+        // visible, worth routing back for, and teaches itself the first time
+        // someone presses the key by accident.
+        state.pickups.push({ id: state.nextId++, x: mon.x + 8, y: mon.y + 8, alive: true });
         break;
       }
     }
@@ -320,7 +432,7 @@ export function step(state: GameState, input: Input, dt: number): GameState {
   // --- camera, score, generation ----------------------------------------
   state.maxY = Math.max(state.maxY, p.y);
   state.cameraY = Math.max(state.cameraY, p.y - CAMERA_LEAD);
-  generateTo(state, state.cameraY + VIEW_HEIGHT * 2);
+  ensureGenerated(state, state.cameraY + VIEW_HEIGHT * 2);
 
   // --- endings -----------------------------------------------------------
   if (p.y >= SUMMIT_Y) {
