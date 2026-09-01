@@ -114,6 +114,25 @@ export function makeRng(seed: number): () => number {
   };
 }
 
+/**
+ * Horizontal overlap, measured across the seam as well as directly.
+ *
+ * The player wraps from one edge to the other but the world does not, and for
+ * a while only the movement knew that: a straight `ax < bx + bw` comparison
+ * silently missed every collision spanning x=0, so platforms near the edges
+ * could not be landed on from the other side and monsters there were
+ * harmless. Movement that wraps and collision that does not is worse than
+ * neither, because the rule you learn at the middle of the screen quietly
+ * stops applying at its edges.
+ */
+function overlapsX(ax: number, aw: number, bx: number, bw: number): boolean {
+  for (const shift of [-WORLD_WIDTH, 0, WORLD_WIDTH]) {
+    const left = ax + shift;
+    if (left < bx + bw && left + aw > bx) return true;
+  }
+  return false;
+}
+
 function overlaps(
   ax: number,
   ay: number,
@@ -124,7 +143,7 @@ function overlaps(
   bw: number,
   bh: number,
 ): boolean {
-  return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  return ay < by + bh && ay + ah > by && overlapsX(ax, aw, bx, bw);
 }
 
 /**
@@ -164,6 +183,47 @@ function seedOpening(state: GameState): void {
 /** How far a bounce off a solid platform lifts you. The ladder depends on it. */
 export const BOUNCE_HEIGHT = (BOUNCE_V * BOUNCE_V) / (2 * -GRAVITY);
 
+/** Shortest distance between two x positions, going either way round the seam. */
+export function wrapDistanceX(a: number, b: number): number {
+  const d = Math.abs(a - b) % WORLD_WIDTH;
+  return Math.min(d, WORLD_WIDTH - d);
+}
+
+/**
+ * How far sideways a jump of `gap` height can be *relied* on to carry you.
+ *
+ * A vertical gap under BOUNCE_HEIGHT is necessary but not sufficient — you
+ * also have to arrive over the platform before you fall past its surface.
+ *
+ * The number here assumes the worst honest case: you land already travelling
+ * at full speed **away** from where you need to go, because you had to move
+ * sideways to reach the rung you are standing on. Reversing costs the whole
+ * accelerate-decelerate round trip, and the two halves cancel out, so the
+ * useful displacement is just top speed times whatever time is left over.
+ *
+ * The optimistic version of this — standing start, perfect timing — gives
+ * 226..271px and was worse than useless: it declared the old random placement
+ * (up to 240px away) fine, while play said otherwise. This gives 124..169px,
+ * which matches what the game actually felt like.
+ */
+export function horizontalReach(gap: number): number {
+  if (gap >= BOUNCE_HEIGHT) return 0;
+  const g = -GRAVITY;
+  const airborne = BOUNCE_V / g + Math.sqrt((2 * (BOUNCE_HEIGHT - gap)) / g);
+  const reversal = (2 * MOVE_MAX) / MOVE_ACCEL;
+  if (airborne <= reversal) return 0;
+  return MOVE_MAX * (airborne - reversal);
+}
+
+/**
+ * The furthest two rung centres may sit apart and still be a fair jump.
+ * Landing counts as any overlap, so the player's centre only has to get
+ * within half a platform plus half a player of the target's centre.
+ */
+export function maxRungSpacingX(gap: number): number {
+  return horizontalReach(gap) + PLATFORM_W / 2 + PLAYER_W / 2;
+}
+
 /**
  * Hazards arrive with altitude, and difficulty is a function of height rather
  * than of a level table — so the curve is a couple of numbers to tune after
@@ -188,7 +248,40 @@ export function ensureGenerated(state: GameState, targetY: number): void {
     }
 
     const progress = Math.min(1, y / SUMMIT_Y);
-    const x = state.rng() * (WORLD_WIDTH - PLATFORM_W);
+
+    // The rung below: the next one has to be reachable from it, and the
+    // corridor between the two has to stay clear.
+    const previous = state.platforms.filter((p) => p.kind !== "broken").at(-1);
+
+    // Placing x at random was the second way this generator built walls, and
+    // the one a player actually reported. The vertical gap was always inside
+    // a bounce, but the landing spot could be half a world away — 240px, when
+    // the widest jump only carries you about 226. It looked like a platform
+    // you should be able to reach and simply was not, however well you played.
+    //
+    const gap = previous ? y - previous.y : 0;
+    const fromCentre = previous ? previous.x + PLATFORM_W / 2 : WORLD_WIDTH / 2;
+    const budget = previous ? maxRungSpacingX(gap) : WORLD_WIDTH / 2;
+
+    // Platforms cannot straddle the seam, so a candidate near an edge gets
+    // clamped — and the clamp moves it, which can quietly push it back out of
+    // reach. So the distance is re-measured after clamping and the throw
+    // retried, rather than assumed. Falling back to directly overhead is
+    // always fair, which makes the worst case dull rather than impossible.
+    let centre = fromCentre;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const throwTo = fromCentre + (state.rng() * 2 - 1) * budget * 0.85;
+      const wrapped = ((throwTo % WORLD_WIDTH) + WORLD_WIDTH) % WORLD_WIDTH;
+      const candidate = Math.max(
+        PLATFORM_W / 2,
+        Math.min(WORLD_WIDTH - PLATFORM_W / 2, wrapped),
+      );
+      if (wrapDistanceX(candidate, fromCentre) <= budget * 0.9) {
+        centre = candidate;
+        break;
+      }
+    }
+    const x = Math.max(0, Math.min(WORLD_WIDTH - PLATFORM_W, centre - PLATFORM_W / 2));
 
     // Every rung of the ladder is landable. Broken platforms used to take
     // their turn in this sequence, and two in a row built a wall taller than
@@ -196,9 +289,6 @@ export function ensureGenerated(state: GameState, targetY: number): void {
     // solid platform at 1948. The climb has to stay possible, so a broken
     // platform is never a rung — it is a decoy placed beside one, which is
     // also how the hand-placed opening teaches it.
-    // The rung below, so the corridor between the two can be kept clear.
-    const previous = state.platforms.filter((p) => p.kind !== "broken").at(-1);
-
     const kind: PlatformKind = state.rng() < 0.06 + progress * 0.02 ? "trampoline" : "solid";
     state.platforms.push({ id: state.nextId++, x, y, kind, alive: true });
 
@@ -370,8 +460,7 @@ export function step(state: GameState, input: Input, dt: number): GameState {
       if (!plat.alive) continue;
       const crossed = prevY >= plat.y && p.y <= plat.y;
       if (!crossed) continue;
-      const withinX = p.x + PLAYER_W / 2 > plat.x && p.x - PLAYER_W / 2 < plat.x + PLATFORM_W;
-      if (!withinX) continue;
+      if (!overlapsX(p.x - PLAYER_W / 2, PLAYER_W, plat.x, PLATFORM_W)) continue;
 
       if (plat.kind === "broken") {
         // The wrong move: it gives way, you keep falling, and it is gone.

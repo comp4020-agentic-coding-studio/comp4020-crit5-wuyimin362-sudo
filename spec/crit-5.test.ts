@@ -3,11 +3,14 @@ import {
   BOUNCE_HEIGHT,
   createGame,
   ensureGenerated,
+  horizontalReach,
   makeRng,
   resetCooldown,
   SUMMIT_Y,
   step,
   TUNING,
+  WORLD_WIDTH,
+  wrapDistanceX,
   type GameState,
   type Input,
 } from "../game.ts";
@@ -188,6 +191,43 @@ describe("the opening teaches itself", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The screen has no side walls: drift off one edge and you come back on the
+// other. Movement wrapped from the start but collision did not, so the rule
+// you learn mid-screen quietly stopped applying at the edges.
+// ---------------------------------------------------------------------------
+describe("the screen wraps, and so do collisions", () => {
+  it("carries the player across the seam", () => {
+    const state = bare({ player: { x: 475, y: 1010, vx: 400, vy: -600, jetpackMs: 0 } });
+
+    step(state, { left: false, right: true, fire: false }, 0.05);
+
+    expect(state.player.x).toBeLessThan(100);
+  });
+
+  it("lands on a platform at the far edge from just past the seam", () => {
+    // Platform hard against the right edge; player just past the left one.
+    const platform = {
+      id: 1,
+      x: WORLD_WIDTH - TUNING.PLATFORM_W,
+      y: 1000,
+      kind: "solid" as const,
+      alive: true,
+    };
+    const state = bare({
+      player: { x: 5, y: 1010, vx: 0, vy: -600, jetpackMs: 0 },
+      platforms: [platform],
+    });
+
+    step(state, IDLE, 0.05);
+
+    expect(
+      state.player.vy,
+      "the platform is 9px away round the seam, so it has to catch the player",
+    ).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Sensors, not contracts. Every one of these was a bug first: the climb built
 // walls it could not clear and the run ended in neither a win nor a loss, it
 // just went on. "Play ends somewhere" is a promise about the generated world,
@@ -216,6 +256,38 @@ describe("the mountain is always climbable", () => {
           0,
         )} apart, past the ${BOUNCE_HEIGHT.toFixed(0)} a bounce buys`,
       ).toBeLessThan(BOUNCE_HEIGHT);
+    }
+  });
+
+  // Reported from actually playing it: "some gaps you just can't jump up".
+  // The vertical sensor above was green the whole time — a jump needs to be
+  // short enough AND near enough, and only the first was being checked.
+  it.each(seeds)("seed %i keeps each rung within sideways reach of the one below", (seed) => {
+    const state = createGame(seed);
+    ensureGenerated(state, SUMMIT_Y);
+
+    const rungs = state.platforms
+      .filter((p) => p.kind !== "broken")
+      .sort((a, b) => a.y - b.y);
+
+    for (let i = 1; i < rungs.length; i++) {
+      const gap = rungs[i]!.y - rungs[i - 1]!.y;
+      if (gap <= 0) continue; // the start ledge is two platforms at one height
+
+      const apart = wrapDistanceX(
+        rungs[i]!.x + TUNING.PLATFORM_W / 2,
+        rungs[i - 1]!.x + TUNING.PLATFORM_W / 2,
+      );
+      // Landing anywhere along the platform counts, so the centres may sit
+      // further apart than the reach by half a platform and half a player.
+      const travel = Math.max(0, apart - TUNING.PLATFORM_W / 2 - TUNING.PLAYER_W / 2);
+
+      expect(
+        travel,
+        `the rung at ${rungs[i]!.y.toFixed(0)} is ${apart.toFixed(0)}px sideways from the one ` +
+          `below it across a ${gap.toFixed(0)}px gap, which allows only ` +
+          `${horizontalReach(gap).toFixed(0)}px of travel`,
+      ).toBeLessThanOrEqual(horizontalReach(gap));
     }
   });
 
